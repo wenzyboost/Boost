@@ -1,72 +1,56 @@
 /**
  * Galaxy Boost Panel — Backend
- * Node.js + Express + better-sqlite3
- * npm install express better-sqlite3 cors crypto uuid
+ * Node.js + Express + sql.js (zero native compilation)
+ * npm install express sql.js cors uuid
  */
 
-const express = require('express');
-const Database = require('better-sqlite3');
-const cors = require('cors');
-const crypto = require('crypto');
+const express  = require('express');
+const cors     = require('cors');
+const crypto   = require('crypto');
 const { v4: uuidv4 } = require('uuid');
+const fs       = require('fs');
+const path     = require('path');
+const initSqlJs = require('sql.js');
 
 const app = express();
-const db = new Database('boost.db');
-
 app.use(cors());
 app.use(express.json());
 
-// ─────────────────────────────────────────────────────────
-// INIT DB
-// ─────────────────────────────────────────────────────────
-db.exec(`
-  CREATE TABLE IF NOT EXISTS tokens (
-    id       INTEGER PRIMARY KEY AUTOINCREMENT,
-    token    TEXT UNIQUE NOT NULL,
-    used     INTEGER DEFAULT 0,
-    added_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS keys (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    key         TEXT UNIQUE NOT NULL,
-    boost_amount INTEGER NOT NULL,
-    used        INTEGER DEFAULT 0,
-    guild_id    TEXT,
-    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
-    redeemed_at DATETIME
-  );
-
-  CREATE TABLE IF NOT EXISTS logs (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    guild_id    TEXT,
-    key_used    TEXT,
-    tokens_used INTEGER,
-    status      TEXT,
-    timestamp   DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS jobs (
-    id          TEXT PRIMARY KEY,
-    guild_id    TEXT,
-    total       INTEGER,
-    completed   INTEGER DEFAULT 0,
-    finished    INTEGER DEFAULT 0,
-    success     INTEGER DEFAULT 0,
-    logs        TEXT DEFAULT '[]',
-    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-`);
+const DB_PATH      = path.join(__dirname, 'boost.db.json');
+const ADMIN_SECRET = process.env.ADMIN_SECRET || 'onyx6767admin';
 
 // ─────────────────────────────────────────────────────────
-// AUTH MIDDLEWARE
+// DB IN-MEMORY + PERSIST TO JSON (compatible Render free)
 // ─────────────────────────────────────────────────────────
-const ADMIN_SECRET = process.env.ADMIN_SECRET || 'onyx6767admin'; // ← change en prod
+let db = {
+  tokens: [],
+  keys:   [],
+  logs:   [],
+  jobs:   {},
+  _nextId: { tokens: 1, keys: 1, logs: 1 }
+};
 
+function loadDB() {
+  try {
+    if (fs.existsSync(DB_PATH)) {
+      db = JSON.parse(fs.readFileSync(DB_PATH, 'utf8'));
+      console.log('[db] loaded from disk');
+    }
+  } catch(e) { console.log('[db] fresh start'); }
+}
+
+function saveDB() {
+  try { fs.writeFileSync(DB_PATH, JSON.stringify(db)); } catch {}
+}
+
+loadDB();
+
+// ─────────────────────────────────────────────────────────
+// AUTH
+// ─────────────────────────────────────────────────────────
 function adminAuth(req, res, next) {
-  if (req.headers['x-admin-key'] !== ADMIN_SECRET) {
+  if (req.headers['x-admin-key'] !== ADMIN_SECRET)
     return res.status(401).json({ error: 'unauthorized' });
-  }
   next();
 }
 
@@ -83,24 +67,25 @@ function generateKey() {
 }
 
 function resolveGuild(input) {
-  const id = input.match(/^(\d{17,19})$/);
+  const id  = input.match(/^(\d{17,19})$/);
   if (id) return id[1];
   const inv = input.match(/discord\.gg\/([a-zA-Z0-9]+)/);
-  if (inv) return inv[1]; // code d'invitation — à résoudre via API Discord si besoin
+  if (inv) return inv[1];
   return null;
 }
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // ─────────────────────────────────────────────────────────
 // PUBLIC ROUTES
 // ─────────────────────────────────────────────────────────
+app.get('/ping', (req, res) => res.json({ status: 'alive', ts: Date.now() }));
 
-// GET /api/stock — nombre de tokens/boosts disponibles
 app.get('/api/stock', (req, res) => {
-  const row = db.prepare('SELECT COUNT(*) AS c FROM tokens WHERE used = 0').get();
-  res.json({ tokens: row.c, boosts_available: row.c * 2 });
+  const available = db.tokens.filter(t => !t.used).length;
+  res.json({ tokens: available, boosts_available: available * 2 });
 });
 
-// POST /api/redeem — un user active sa key
 app.post('/api/redeem', async (req, res) => {
   const { key, guild_id } = req.body;
   if (!key || !guild_id) return res.status(400).json({ error: 'key et guild_id requis' });
@@ -108,135 +93,116 @@ app.post('/api/redeem', async (req, res) => {
   const guild = resolveGuild(guild_id);
   if (!guild) return res.status(400).json({ error: 'Serveur Discord invalide' });
 
-  const keyRow = db.prepare('SELECT * FROM keys WHERE key = ?').get(key);
-  if (!keyRow) return res.status(404).json({ error: 'Clé introuvable' });
+  const keyRow = db.keys.find(k => k.key === key);
+  if (!keyRow)     return res.status(404).json({ error: 'Clé introuvable' });
   if (keyRow.used) return res.status(400).json({ error: 'Clé déjà utilisée' });
 
   const tokensNeeded = keyRow.boost_amount / 2;
-  const available = db.prepare('SELECT COUNT(*) AS c FROM tokens WHERE used = 0').get();
+  const available    = db.tokens.filter(t => !t.used);
 
-  if (available.c < tokensNeeded) {
+  if (available.length < tokensNeeded)
     return res.status(503).json({ error: 'Stock insuffisant. Contacter le support.' });
-  }
 
-  // Marque la key comme utilisée
-  db.prepare('UPDATE keys SET used = 1, guild_id = ?, redeemed_at = CURRENT_TIMESTAMP WHERE key = ?')
-    .run(guild, key);
+  keyRow.used      = true;
+  keyRow.guild_id  = guild;
+  keyRow.redeemed_at = new Date().toISOString();
+  saveDB();
 
-  // Crée un job pour tracker la progression
   const jobId = uuidv4();
-  db.prepare('INSERT INTO jobs (id, guild_id, total) VALUES (?, ?, ?)')
-    .run(jobId, guild, keyRow.boost_amount);
+  db.jobs[jobId] = {
+    id: jobId, guild_id: guild,
+    total: keyRow.boost_amount,
+    completed: 0, finished: false, success: false,
+    logs: [], created_at: new Date().toISOString()
+  };
+  saveDB();
 
-  // Lance le process en arrière-plan
   processBoosts(jobId, guild, tokensNeeded, key);
 
   res.json({ job_id: jobId, total_boosts: keyRow.boost_amount });
 });
 
-// GET /api/job/:id — état d'un job
 app.get('/api/job/:id', (req, res) => {
-  const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(req.params.id);
+  const job = db.jobs[req.params.id];
   if (!job) return res.status(404).json({ error: 'Job introuvable' });
-  res.json({
-    job_id: job.id,
-    completed: job.completed,
-    total: job.total,
-    finished: !!job.finished,
-    success: !!job.success,
-    logs: JSON.parse(job.logs || '[]')
-  });
+  res.json(job);
 });
 
 // ─────────────────────────────────────────────────────────
-// PROCESS BOOSTS — logique principale
+// PROCESS BOOSTS
 // ─────────────────────────────────────────────────────────
 async function processBoosts(jobId, guild, tokensCount, keyUsed) {
-  const tokens = db.prepare('SELECT * FROM tokens WHERE used = 0 LIMIT ?').all(tokensCount);
-  const logs = [];
-  let completed = 0;
-  let success = true;
+  const job    = db.jobs[jobId];
+  const tokens = db.tokens.filter(t => !t.used).slice(0, tokensCount);
+  let success  = true;
 
   for (const tokenRow of tokens) {
     try {
-      // ── 1. Join server ──────────────────────────────────
-      const joinRes = await joinServer(tokenRow.token, guild);
-
+      const joinRes  = await joinServer(tokenRow.token, guild);
       if (!joinRes.ok) {
-        logs.push({ status: 'fail', message: `Token ${tokenRow.id} — join échoué (${joinRes.code})` });
+        job.logs.push({ status: 'fail', message: `Token ${tokenRow.id} — join échoué (${joinRes.code})` });
         success = false;
-        continue;
+        saveDB(); continue;
       }
 
-      // ── 2. Apply boost ──────────────────────────────────
       const boostRes = await applyBoost(tokenRow.token, guild);
-
       if (boostRes.ok) {
-        completed += 2; // chaque token = 2 boosts
-        logs.push({ status: 'done', message: `Token ${tokenRow.id} — 2 boosts appliqués ✓` });
-        db.prepare('UPDATE tokens SET used = 1 WHERE id = ?').run(tokenRow.id);
+        job.completed += 2;
+        job.logs.push({ status: 'done', message: `Token ${tokenRow.id} — 2 boosts appliqués ✓` });
+        tokenRow.used = true;
       } else {
-        logs.push({ status: 'fail', message: `Token ${tokenRow.id} — boost échoué (${boostRes.code})` });
+        job.logs.push({ status: 'fail', message: `Token ${tokenRow.id} — boost échoué (${boostRes.code})` });
         success = false;
       }
-
-    } catch (e) {
-      logs.push({ status: 'fail', message: `Token ${tokenRow.id} — erreur: ${e.message}` });
+    } catch(e) {
+      job.logs.push({ status: 'fail', message: `Token ${tokenRow.id} — erreur: ${e.message}` });
       success = false;
     }
 
-    // Update job state après chaque token
-    db.prepare('UPDATE jobs SET completed = ?, logs = ? WHERE id = ?')
-      .run(completed, JSON.stringify(logs), jobId);
-
-    // Délai anti-rate-limit Discord
+    saveDB();
     await sleep(800 + Math.random() * 400);
   }
 
-  // Finalise le job
-  db.prepare('UPDATE jobs SET completed = ?, logs = ?, finished = 1, success = ? WHERE id = ?')
-    .run(completed, JSON.stringify(logs), success ? 1 : 0, jobId);
+  job.finished = true;
+  job.success  = success;
 
-  // Log global
-  db.prepare('INSERT INTO logs (guild_id, key_used, tokens_used, status) VALUES (?, ?, ?, ?)')
-    .run(guild, keyUsed, tokensCount, success ? 'success' : 'partial');
+  const logEntry = {
+    id: db._nextId.logs++,
+    guild_id: guild, key_used: keyUsed,
+    tokens_used: tokensCount,
+    status: success ? 'success' : 'partial',
+    timestamp: new Date().toISOString()
+  };
+  db.logs.unshift(logEntry);
+  saveDB();
 }
 
 // ─────────────────────────────────────────────────────────
-// DISCORD API CALLS
+// DISCORD API
 // ─────────────────────────────────────────────────────────
 async function joinServer(token, guildOrCode) {
   try {
-    // Si c'est un code d'invitation
     if (!/^\d{17,19}$/.test(guildOrCode)) {
       const r = await fetch(`https://discord.com/api/v9/invites/${guildOrCode}`, {
         method: 'POST',
         headers: discordHeaders(token),
         body: JSON.stringify({})
       });
-      const d = await r.json();
-      return { ok: r.ok, code: r.status, data: d };
+      return { ok: r.ok, code: r.status };
     }
-    // Si c'est un ID direct, join via une invite si disponible
     return { ok: true, code: 200 };
-  } catch (e) {
-    return { ok: false, code: 0 };
-  }
+  } catch(e) { return { ok: false, code: 0 }; }
 }
 
 async function applyBoost(token, guildId) {
   try {
-    // Récupère les subscriptions Nitro du compte
     const subRes = await fetch('https://discord.com/api/v9/users/@me/guilds/premium/subscription-slots', {
       headers: discordHeaders(token)
     });
     const slots = await subRes.json();
 
-    if (!Array.isArray(slots) || slots.length === 0) {
-      return { ok: false, code: 'no_slots' };
-    }
+    if (!Array.isArray(slots) || !slots.length) return { ok: false, code: 'no_slots' };
 
-    // Apply chaque slot disponible (max 2)
     const toApply = slots.filter(s => !s.premium_guild_subscription).slice(0, 2);
     let applied = 0;
 
@@ -249,11 +215,8 @@ async function applyBoost(token, guildId) {
       if (r.ok || r.status === 201) applied++;
       await sleep(300);
     }
-
     return { ok: applied > 0, code: applied };
-  } catch (e) {
-    return { ok: false, code: e.message };
-  }
+  } catch(e) { return { ok: false, code: e.message }; }
 }
 
 function discordHeaders(token) {
@@ -269,114 +232,84 @@ function discordHeaders(token) {
   };
 }
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
 // ─────────────────────────────────────────────────────────
 // ADMIN ROUTES
 // ─────────────────────────────────────────────────────────
-
-// Stats
 app.get('/api/admin/stats', adminAuth, (req, res) => {
-  const tokensAvail = db.prepare('SELECT COUNT(*) AS c FROM tokens WHERE used = 0').get().c;
-  const keysTotal   = db.prepare('SELECT COUNT(*) AS c FROM keys').get().c;
-  const keysUsed    = db.prepare('SELECT COUNT(*) AS c FROM keys WHERE used = 1').get().c;
-  const boostsSent  = db.prepare("SELECT SUM(tokens_used * 2) AS s FROM logs WHERE status IN ('success','partial')").get().s || 0;
-
+  const tokensAvail = db.tokens.filter(t => !t.used).length;
+  const keysTotal   = db.keys.length;
+  const keysUsed    = db.keys.filter(k => k.used).length;
+  const boostsSent  = db.logs.reduce((acc, l) => acc + (l.tokens_used * 2), 0);
   res.json({
     tokens_available: tokensAvail,
     boosts_available: tokensAvail * 2,
-    keys_total:   keysTotal,
-    keys_used:    keysUsed,
-    boosts_sent:  boostsSent
+    keys_total: keysTotal, keys_used: keysUsed, boosts_sent: boostsSent
   });
 });
 
-// Lister tokens
 app.get('/api/admin/tokens', adminAuth, (req, res) => {
-  const tokens = db.prepare('SELECT * FROM tokens ORDER BY id DESC LIMIT 200').all();
-  res.json(tokens);
+  res.json(db.tokens.slice(0, 200).reverse());
 });
 
-// Ajouter tokens
 app.post('/api/admin/tokens', adminAuth, (req, res) => {
   const { tokens } = req.body;
-  if (!Array.isArray(tokens) || !tokens.length) return res.status(400).json({ error: 'tokens array requis' });
+  if (!Array.isArray(tokens) || !tokens.length)
+    return res.status(400).json({ error: 'tokens array requis' });
 
-  const insert = db.prepare('INSERT OR IGNORE INTO tokens (token) VALUES (?)');
   let added = 0, dupes = 0;
-
-  const insertAll = db.transaction(() => {
-    for (const t of tokens) {
-      const clean = t.trim();
-      if (!clean) continue;
-      const info = insert.run(clean);
-      if (info.changes > 0) added++;
-      else dupes++;
-    }
-  });
-  insertAll();
-
+  for (const t of tokens) {
+    const clean = t.trim();
+    if (!clean) continue;
+    if (db.tokens.find(x => x.token === clean)) { dupes++; continue; }
+    db.tokens.push({ id: db._nextId.tokens++, token: clean, used: false, added_at: new Date().toISOString() });
+    added++;
+  }
+  saveDB();
   res.json({ added, duplicates: dupes });
 });
 
-// Supprimer token
 app.delete('/api/admin/tokens/:id', adminAuth, (req, res) => {
-  db.prepare('DELETE FROM tokens WHERE id = ?').run(req.params.id);
+  const id = parseInt(req.params.id);
+  db.tokens = db.tokens.filter(t => t.id !== id);
+  saveDB();
   res.json({ ok: true });
 });
 
-// Générer keys
 app.post('/api/admin/keys/generate', adminAuth, (req, res) => {
   const { boost_amount, quantity = 1 } = req.body;
   if (!boost_amount) return res.status(400).json({ error: 'boost_amount requis' });
 
-  const insert = db.prepare('INSERT INTO keys (key, boost_amount) VALUES (?, ?)');
   const keys = [];
-
   for (let i = 0; i < Math.min(quantity, 100); i++) {
     const k = generateKey();
-    insert.run(k, boost_amount);
+    db.keys.push({ id: db._nextId.keys++, key: k, boost_amount, used: false, guild_id: null, created_at: new Date().toISOString() });
     keys.push(k);
   }
-
+  saveDB();
   res.json({ keys });
 });
 
-// Lister keys
 app.get('/api/admin/keys', adminAuth, (req, res) => {
-  const keys = db.prepare('SELECT * FROM keys ORDER BY id DESC LIMIT 500').all();
-  res.json(keys);
+  res.json([...db.keys].reverse().slice(0, 500));
 });
 
-// Lister logs
 app.get('/api/admin/logs', adminAuth, (req, res) => {
-  const logs = db.prepare('SELECT * FROM logs ORDER BY id DESC LIMIT 200').all();
-  res.json(logs);
+  res.json(db.logs.slice(0, 200));
 });
 
 // ─────────────────────────────────────────────────────────
-// KEEP-ALIVE (anti-sleep Render free tier)
+// KEEP-ALIVE
 // ─────────────────────────────────────────────────────────
 const SELF_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${process.env.PORT || 3001}`;
-
-function keepAlive() {
-  fetch(`${SELF_URL}/ping`)
-    .then(() => console.log('[keep-alive] ping ok'))
-    .catch(e => console.log('[keep-alive] ping fail:', e.message));
-}
-
-// Ping toutes les 10 minutes
-setInterval(keepAlive, 10 * 60 * 1000);
-
-// Route ping
-app.get('/ping', (req, res) => res.json({ status: 'alive', ts: Date.now() }));
+setInterval(() => {
+  fetch(`${SELF_URL}/ping`).catch(() => {});
+}, 10 * 60 * 1000);
 
 // ─────────────────────────────────────────────────────────
 // START
 // ─────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`Galaxy Boost API running on :${PORT}`);
+  console.log(`Galaxy Boost API :${PORT}`);
   console.log(`Admin key: ${ADMIN_SECRET}`);
-  console.log(`Keep-alive actif → ${SELF_URL}/ping`);
 });
