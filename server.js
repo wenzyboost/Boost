@@ -355,10 +355,28 @@ app.get('/api/admin/logs', adminAuth, (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────
+// KEEP-ALIVE (anti-sleep Render free tier)
+// ─────────────────────────────────────────────────────────
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${process.env.PORT || 3001}`;
+
+function keepAlive() {
+  fetch(`${SELF_URL}/ping`)
+    .then(() => console.log('[keep-alive] ping ok'))
+    .catch(e => console.log('[keep-alive] ping fail:', e.message));
+}
+
+// Ping toutes les 10 minutes
+setInterval(keepAlive, 10 * 60 * 1000);
+
+// Route ping
+app.get('/ping', (req, res) => res.json({ status: 'alive', ts: Date.now() }));
+
+// ─────────────────────────────────────────────────────────
 // START
 // ─────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`Galaxy Boost API running on :${PORT}`);
   console.log(`Admin key: ${ADMIN_SECRET}`);
+  console.log(`Keep-alive actif → ${SELF_URL}/ping`);
 });
