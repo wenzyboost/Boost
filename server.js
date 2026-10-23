@@ -17,7 +17,7 @@ app.use(cors());
 app.use(express.json());
 
 const DB_PATH      = path.join(__dirname, 'boost.db.json');
-const ADMIN_SECRET = process.env.ADMIN_SECRET || 'onyx6767admin';
+const ADMIN_SECRET = process.env.ADMIN_SECRET || 'KIRITO';
 
 // ─────────────────────────────────────────────────────────
 // DB IN-MEMORY + PERSIST TO JSON (compatible Render free)
@@ -291,6 +291,22 @@ app.post('/api/admin/keys/generate', adminAuth, (req, res) => {
 
 app.get('/api/admin/keys', adminAuth, (req, res) => {
   res.json([...db.keys].reverse().slice(0, 500));
+});
+
+// Clear all tokens
+app.delete('/api/admin/tokens/clear', adminAuth, (req, res) => {
+  db.tokens = [];
+  db._nextId.tokens = 1;
+  saveDB();
+  res.json({ ok: true });
+});
+
+// Clear all keys
+app.delete('/api/admin/keys/clear', adminAuth, (req, res) => {
+  db.keys = [];
+  db._nextId.keys = 1;
+  saveDB();
+  res.json({ ok: true });
 });
 
 app.get('/api/admin/logs', adminAuth, (req, res) => {
