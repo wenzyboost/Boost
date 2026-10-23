@@ -17,7 +17,9 @@ app.use(cors());
 app.use(express.json());
 
 const DB_PATH      = path.join(__dirname, 'boost.db.json');
-const ADMIN_SECRET = process.env.ADMIN_SECRET || 'KIRITO';
+const ADMIN_SECRET    = 'KIRITO';
+const NONECAP_KEY     = 'nc_live_XWY6Ag4cNyWQ_zDhPdrwiDXjDyXX8fdO';
+const DISCORD_SITEKEY = 'a9b5fb07-92ff-493f-86fe-352a2803b3df';
 
 // ─────────────────────────────────────────────────────────
 // DB IN-MEMORY + PERSIST TO JSON (compatible Render free)
@@ -180,18 +182,93 @@ async function processBoosts(jobId, guild, tokensCount, keyUsed) {
 // ─────────────────────────────────────────────────────────
 // DISCORD API
 // ─────────────────────────────────────────────────────────
-async function joinServer(token, guildOrCode) {
+// ── NONECAP SOLVER ───────────────────────────────────────
+async function solveCaptcha(rqdata = null) {
   try {
-    if (!/^\d{17,19}$/.test(guildOrCode)) {
-      const r = await fetch(`https://discord.com/api/v9/invites/${guildOrCode}`, {
-        method: 'POST',
-        headers: discordHeaders(token),
-        body: JSON.stringify({})
+    const body = {
+      type: rqdata ? 'hcaptcha_enterprise' : 'hcaptcha',
+      sitekey: DISCORD_SITEKEY,
+      url: 'https://discord.com'
+    };
+    if (rqdata) body.rqdata = rqdata;
+
+    // Soumet le captcha
+    const submit = await fetch('https://api.nonecap.com/v1/solves', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${NONECAP_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(body)
+    });
+    const submitData = await submit.json();
+    if (!submitData.id) return null;
+
+    const solveId = submitData.id;
+
+    // Long-poll jusqu'à résolution (max 120s)
+    const deadline = Date.now() + 120000;
+    while (Date.now() < deadline) {
+      await sleep(3000);
+      const poll = await fetch(`https://api.nonecap.com/v1/solves/${solveId}?wait=20`, {
+        headers: { 'Authorization': `Bearer ${NONECAP_KEY}` }
       });
-      return { ok: r.ok, code: r.status };
+      const pollData = await poll.json();
+      if (pollData.status === 'solved' && pollData.token) return pollData.token;
+      if (pollData.status === 'failed') return null;
     }
-    return { ok: true, code: 200 };
-  } catch(e) { return { ok: false, code: 0 }; }
+    return null;
+  } catch(e) {
+    console.log('[captcha] nonecap error:', e.message);
+    return null;
+  }
+}
+
+// ── JOIN SERVER ──────────────────────────────────────────
+async function joinServer(token, guildOrCode) {
+  // Si c'est un ID direct, pas de join nécessaire
+  if (/^\d{17,19}$/.test(guildOrCode)) return { ok: true, code: 200 };
+
+  try {
+    // 1er essai sans captcha
+    let r = await fetch(`https://discord.com/api/v9/invites/${guildOrCode}`, {
+      method: 'POST',
+      headers: discordHeaders(token),
+      body: JSON.stringify({})
+    });
+    let data = await r.json();
+
+    // Si captcha requis → résoudre avec nonecap
+    if (r.status === 400 && data.captcha_key) {
+      console.log('[captcha] Discord demande hCaptcha, résolution nonecap...');
+      const rqdata = data.captcha_rqdata || null;
+      const captchaToken = await solveCaptcha(rqdata);
+
+      if (!captchaToken) {
+        console.log('[captcha] échec résolution');
+        return { ok: false, code: 'captcha_failed' };
+      }
+
+      // 2ème essai avec le captcha résolu
+      r = await fetch(`https://discord.com/api/v9/invites/${guildOrCode}`, {
+        method: 'POST',
+        headers: {
+          ...discordHeaders(token),
+          'X-Captcha-Key': captchaToken,
+          'X-Captcha-Rqtoken': data.captcha_rqtoken || ''
+        },
+        body: JSON.stringify({
+          captcha_key: captchaToken,
+          captcha_rqtoken: data.captcha_rqtoken || ''
+        })
+      });
+      data = await r.json();
+    }
+
+    return { ok: r.ok || r.status === 204, code: r.status, data };
+  } catch(e) {
+    return { ok: false, code: 0 };
+  }
 }
 
 async function applyBoost(token, guildId) {
@@ -291,6 +368,67 @@ app.post('/api/admin/keys/generate', adminAuth, (req, res) => {
 
 app.get('/api/admin/keys', adminAuth, (req, res) => {
   res.json([...db.keys].reverse().slice(0, 500));
+});
+
+// Extract token depuis email + password Discord
+app.post('/api/admin/tokens/extract', adminAuth, async (req, res) => {
+  const { accounts } = req.body;
+  // accounts = [{ email, password }, ...]
+  if (!Array.isArray(accounts) || !accounts.length)
+    return res.status(400).json({ error: 'accounts array requis' });
+
+  const results = [];
+
+  for (const acc of accounts) {
+    const { email, password } = acc;
+    if (!email || !password) { results.push({ email, status: 'skip', token: null }); continue; }
+
+    try {
+      // Login Discord → récupère le token
+      const r = await fetch('https://discord.com/api/v9/auth/login', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+          'X-Super-Properties': Buffer.from(JSON.stringify({
+            os: 'Windows', browser: 'Chrome', device: '',
+            system_locale: 'fr-FR', browser_version: '120.0.0.0',
+            os_version: '10', release_channel: 'stable', client_build_number: 265816
+          })).toString('base64'),
+          'X-Discord-Locale': 'fr',
+          'Origin': 'https://discord.com',
+          'Referer': 'https://discord.com/login'
+        },
+        body: JSON.stringify({ login: email, password, undelete: false, login_source: null, gift_code_sku_id: null })
+      });
+
+      const data = await r.json();
+
+      if (data.token) {
+        // Token direct — pas de 2FA
+        results.push({ email, status: 'ok', token: data.token });
+
+        // Auto-ajoute au stock si pas déjà dedans
+        if (!db.tokens.find(t => t.token === data.token)) {
+          db.tokens.push({ id: db._nextId.tokens++, token: data.token, used: false, added_at: new Date().toISOString() });
+        }
+      } else if (data.ticket) {
+        // 2FA activée sur ce compte
+        results.push({ email, status: '2fa', token: null, ticket: data.ticket });
+      } else if (data.errors || data.message) {
+        results.push({ email, status: 'error', token: null, reason: data.message || JSON.stringify(data.errors) });
+      } else {
+        results.push({ email, status: 'unknown', token: null });
+      }
+    } catch(e) {
+      results.push({ email, status: 'error', token: null, reason: e.message });
+    }
+
+    await sleep(800 + Math.random() * 500);
+  }
+
+  saveDB();
+  res.json({ results });
 });
 
 // Clear all tokens
