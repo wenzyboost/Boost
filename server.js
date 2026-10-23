@@ -273,27 +273,70 @@ async function joinServer(token, guildOrCode) {
 
 async function applyBoost(token, guildId) {
   try {
+    // Récupère les subscriptions Nitro actives
     const subRes = await fetch('https://discord.com/api/v9/users/@me/guilds/premium/subscription-slots', {
       headers: discordHeaders(token)
     });
     const slots = await subRes.json();
+    console.log('[boost] slots bruts:', JSON.stringify(slots));
 
     if (!Array.isArray(slots) || !slots.length) return { ok: false, code: 'no_slots' };
 
-    const toApply = slots.filter(s => !s.premium_guild_subscription).slice(0, 2);
-    let applied = 0;
+    // Filtre les slots libres (pas déjà utilisés sur un autre serveur)
+    const freeSlots = slots.filter(s => {
+      if (s.canceled) return false;
+      if (!s.premium_guild_subscription) return true; // slot libre
+      return false; // déjà boosted ailleurs
+    }).slice(0, 2);
 
-    for (const slot of toApply) {
+    console.log(`[boost] slots libres: ${freeSlots.length}/${slots.length}`);
+
+    if (!freeSlots.length) {
+      // Tente de retirer les boosts existants puis ré-appliquer
+      const usedSlots = slots.filter(s => s.premium_guild_subscription).slice(0, 2);
+      if (!usedSlots.length) return { ok: false, code: 'no_slots' };
+
+      // Retire les boosts de l'ancien serveur
+      for (const slot of usedSlots) {
+        const oldGuild = slot.premium_guild_subscription?.guild_id;
+        if (oldGuild) {
+          await fetch(`https://discord.com/api/v9/guilds/${oldGuild}/premium/subscriptions/${slot.premium_guild_subscription.id}`, {
+            method: 'DELETE',
+            headers: discordHeaders(token)
+          });
+          await sleep(500);
+        }
+      }
+
+      // Re-fetch slots après retrait
+      await sleep(1000);
+      const reRes = await fetch('https://discord.com/api/v9/users/@me/guilds/premium/subscription-slots', {
+        headers: discordHeaders(token)
+      });
+      const reSlots = await reRes.json();
+      const refreshed = Array.isArray(reSlots) ? reSlots.filter(s => !s.premium_guild_subscription && !s.canceled).slice(0, 2) : [];
+      if (!refreshed.length) return { ok: false, code: 'no_slots_after_remove' };
+      freeSlots.push(...refreshed);
+    }
+
+    // Applique les boosts
+    let applied = 0;
+    for (const slot of freeSlots) {
       const r = await fetch(`https://discord.com/api/v9/guilds/${guildId}/premium/subscriptions`, {
         method: 'PUT',
         headers: discordHeaders(token),
         body: JSON.stringify({ user_premium_guild_subscription_slot_ids: [slot.id] })
       });
+      const body = await r.json().catch(() => ({}));
+      console.log(`[boost] slot ${slot.id} → status ${r.status}`, JSON.stringify(body));
       if (r.ok || r.status === 201) applied++;
-      await sleep(300);
+      await sleep(500);
     }
     return { ok: applied > 0, code: applied };
-  } catch(e) { return { ok: false, code: e.message }; }
+  } catch(e) {
+    console.log('[boost] erreur:', e.message);
+    return { ok: false, code: e.message };
+  }
 }
 
 function discordHeaders(token) {
